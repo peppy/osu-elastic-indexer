@@ -37,16 +37,15 @@ namespace osu.ElasticIndexer
 
             foreach (var mode in AppSettings.Modes)
             {
-                var indexName = $"{AppSettings.Prefix}high_scores_{mode}";
-                var upcase = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(mode);
-                var className = $"{typeof(HighScore).Namespace}.HighScore{upcase}";
+                var modeTitleCase = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(mode);
+                var className = $"{typeof(HighScore).Namespace}.HighScore{modeTitleCase}";
 
                 Type indexerType = typeof(HighScoreIndexer<>)
                     .MakeGenericType(Type.GetType(className, true));
 
                 var indexer = (IIndexer) Activator.CreateInstance(indexerType);
                 indexer.Suffix = suffix;
-                indexer.Name = indexName;
+                indexer.Name = $"{AppSettings.Prefix}high_scores_{mode}";
                 indexer.ResumeFrom = resumeFrom;
                 indexer.Run();
             }
