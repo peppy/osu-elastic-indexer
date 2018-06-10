@@ -2,7 +2,6 @@
 // Licensed under the MIT Licence - https://raw.githubusercontent.com/ppy/osu-elastic-indexer/master/LICENCE
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
@@ -24,22 +23,10 @@ namespace osu.ElasticIndexer
         private readonly IDbConnection dbConnection;
         private readonly ElasticClient elasticClient;
 
-        private readonly ConcurrentBag<Task<IBulkResponse>> pendingTasks = new ConcurrentBag<Task<IBulkResponse>>();
-
-        // Queues
-        private readonly BlockingCollection<List<T>> defaultQueue = new BlockingCollection<List<T>>(AppSettings.QueueSize);
-        private readonly BlockingCollection<List<T>> retryQueue = new BlockingCollection<List<T>>(AppSettings.QueueSize);
-        private readonly BlockingCollection<List<T>>[] queues;
-
-        private int waitingCount => pendingTasks.Count + defaultQueue.Count + retryQueue.Count;
-
-        // throttle control
-        private int delay;
+        private string indexName;
 
         public HighScoreIndexer()
         {
-            queues = new [] { retryQueue, defaultQueue };
-
             dbConnection = new MySqlConnection(AppSettings.ConnectionString);
             elasticClient = new ElasticClient
             (
@@ -49,127 +36,68 @@ namespace osu.ElasticIndexer
 
         public void Run()
         {
-            var index = findOrCreateIndex(Name);
+            indexName = findOrCreateIndex(Name);
+
             // find out if we should be resuming
-            var resumeFrom = ResumeFrom ?? IndexMeta.GetByName(index)?.LastId;
+            var resumeFrom = ResumeFrom ?? IndexMeta.GetByName(indexName)?.LastId;
 
             Console.WriteLine();
-            Console.WriteLine($"{typeof(T)}, index `{index}`, chunkSize `{AppSettings.ChunkSize}`, resume `{resumeFrom}`");
+            Console.WriteLine($"{typeof(T)}, index `{indexName}`, chunkSize `{AppSettings.ChunkSize}`, resume `{resumeFrom}`");
             Console.WriteLine();
 
             var start = DateTime.Now;
-            using (var consumerTask = consumerLoop(index))
-            using (var producerTask = producerLoop(resumeFrom))
+
+            using (dbConnection)
             {
-                producerTask.Wait();
-                endingTask().Wait();
-                consumerTask.Wait();
+                dbConnection.Open();
 
-                var count = producerTask.Result;
-                var span = DateTime.Now - start;
-                Console.WriteLine($"{count} records took {span}");
-                if (count > 0) Console.WriteLine($"{count / span.TotalSeconds} records/s");
-            }
+                // TODO: retry needs to be added on timeout
+                var chunks = Model.Chunk<T>(dbConnection, AppSettings.ChunkSize, resumeFrom);
 
-            updateAlias(Name, index);
-        }
-
-        private async Task endingTask()
-        {
-            await Task.WhenAll(pendingTasks);
-            // Spin until queue and pendingTasks are empty.
-            while (waitingCount > 0)
-            {
-                var delayDuration = Math.Max(waitingCount, delay) * 100;
-                Console.WriteLine($@"Waiting for queues to empty...({defaultQueue.Count}) ({retryQueue.Count}) ({pendingTasks.Count}) delay for {delayDuration} ms");
-
-                await Task.Delay(delayDuration);
-                await Task.WhenAll(pendingTasks);
-            }
-
-            retryQueue.CompleteAdding();
-        }
-
-        private Task consumerLoop(string index)
-        {
-            return Task.Run(() =>
-            {
-                while (!defaultQueue.IsCompleted || !retryQueue.IsCompleted)
+                Parallel.ForEach(chunks, chunk =>
                 {
-                    if (delay > 0) Task.Delay(delay * 100).Wait();
-                    waitIfTooBusy();
+                    consumeChunk(chunk);
 
-                    List<T> chunk;
+                    var count = chunk.Count;
+                    var timeTaken = DateTime.Now - start;
+                    Console.WriteLine($"{count} records took {timeTaken}");
+                    if (count > 0) Console.WriteLine($"{count / timeTaken.TotalSeconds} records/s");
+                });
+            }
 
-                    try
-                    {
-                        BlockingCollection<List<T>>.TakeFromAny(queues, out chunk);
-                    }
-                    catch (ArgumentException ex)
-                    {
-                        // queue was marked as completed while blocked.
-                        Console.WriteLine(ex.Message);
-                        continue;
-                    }
+            updateAlias(Name, indexName);
+        }
 
-                    var bulkDescriptor = new BulkDescriptor().Index(index).IndexMany(chunk);
+        private void consumeChunk(List<T> chunk)
+        {
+            while (true)
+            {
+                try
+                {
+                    var bulkDescriptor = new BulkDescriptor().Index(indexName).IndexMany(chunk);
 
-                    Task<IBulkResponse> task = elasticClient.BulkAsync(bulkDescriptor);
-                    pendingTasks.Add(task);
+                    var result = elasticClient.Bulk(bulkDescriptor);
 
-                    task.ContinueWith(t =>
-                    {
-                        // wait until after any requeueing needs to be done before removing the task.
-                        handleResult(task.Result, chunk);
-                        pendingTasks.TryTake(out task);
-                    });
+                    throwOnFailure(result);
 
                     // TODO: Less blind-fire update.
                     // I feel like this is in the wrong place...
                     IndexMeta.Update(new IndexMeta
                     {
-                        Index = index,
+                        Index = indexName,
                         Alias = Name,
                         LastId = chunk.Last().CursorValue,
                         UpdatedAt = DateTimeOffset.UtcNow
                     });
-
-                    if (delay > 0) Interlocked.Decrement(ref delay);
                 }
-            });
-        }
-
-        private Task<long> producerLoop(long? resumeFrom)
-        {
-            return Task.Run(() =>
-            {
-                long count = 0;
-
-                using (dbConnection)
+                catch (Exception e)
                 {
-                    dbConnection.Open();
-                    // TODO: retry needs to be added on timeout
-                    var chunks = Model.Chunk<T>(dbConnection, AppSettings.ChunkSize, resumeFrom);
-                    foreach (var chunk in chunks)
-                    {
-                        defaultQueue.Add(chunk);
-                        count += chunk.Count;
-                    }
+                    Console.WriteLine($"retrying chunk with lastId {chunk.Last().CursorValue} (failed with: {e})");
+                    Thread.Sleep(10000);
+                    continue;
                 }
 
-                defaultQueue.CompleteAdding();
-                Console.WriteLine("Mark queue as completed.");
-
-                return count;
-            });
-        }
-
-        private void waitIfTooBusy()
-        {
-            // too many pending responses, wait and let them be handled.
-            if (pendingTasks.Count > AppSettings.QueueSize * 2) {
-                Console.WriteLine($"Too many pending responses ({pendingTasks.Count}), waiting...");
-                pendingTasks.FirstOrDefault()?.Wait();
+                break;
             }
         }
 
@@ -218,14 +146,10 @@ namespace osu.ElasticIndexer
             // TODO: cases not covered should throw an Exception (aliased but not tracked, etc).
         }
 
-        private void handleResult(IBulkResponse response, List<T> chunk)
+        private void throwOnFailure(IBulkResponse response)
         {
-            if (response.ItemsWithErrors.All(item => item.Status != 429)) return;
-
-            Interlocked.Increment(ref delay);
-            retryQueue.Add(chunk);
-
-            Console.WriteLine($"Server returned 429, requeued chunk with lastId {chunk.Last().CursorValue}");
+            if (response.ItemsWithErrors.Any(item => item.Status == 429))
+                throw new Exception("Server returned 429");
         }
 
         private void updateAlias(string alias, string index)
