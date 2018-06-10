@@ -15,19 +15,23 @@ namespace osu.ElasticIndexer
             if (AppSettings.IsWatching)
                 Console.WriteLine($"Running in watch mode with {AppSettings.PollingInterval}ms poll.");
 
-            bool ranOnce = false;
-
-            while (!ranOnce || AppSettings.IsWatching)
+            if (AppSettings.IsWatching)
             {
-                // When running in watch mode, the indexer should be told to resume from the
-                // last known saved point instead of the configured value.
-                RunLoop(ranOnce ? null : AppSettings.ResumeFrom);
-                ranOnce = true;
-                if (AppSettings.IsWatching) Thread.Sleep(AppSettings.PollingInterval);
+                while (true)
+                {
+                    // When running in watch mode, the indexer should be told to resume from the
+                    // last known saved point instead of the configured value.
+                    RunLoop(AppSettings.ResumeFrom);
+                    Thread.Sleep(AppSettings.PollingInterval);
+                }
+            }
+            else
+            {
+                RunLoop();
             }
         }
 
-        public void RunLoop(long? resumeFrom)
+        public void RunLoop(long? resumeFrom = null)
         {
             var suffix = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
 
