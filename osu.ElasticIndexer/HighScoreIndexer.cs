@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -20,14 +19,12 @@ namespace osu.ElasticIndexer
         public long? ResumeFrom { get; set; }
         public string Suffix { get; set; }
 
-        private readonly IDbConnection dbConnection;
         private readonly ElasticClient elasticClient;
 
         private string indexName;
 
         public HighScoreIndexer()
         {
-            dbConnection = new MySqlConnection(AppSettings.ConnectionString);
             elasticClient = new ElasticClient
             (
                 new ConnectionSettings(new Uri(AppSettings.ElasticsearchHost))
@@ -47,7 +44,7 @@ namespace osu.ElasticIndexer
 
             var start = DateTime.Now;
 
-            using (dbConnection)
+            using (var dbConnection = new MySqlConnection(AppSettings.ConnectionString))
             {
                 dbConnection.Open();
 
